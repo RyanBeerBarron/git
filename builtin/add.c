@@ -28,7 +28,7 @@ static const char * const builtin_add_usage[] = {
 	N_("git add [<options>] [--] <pathspec>..."),
 	NULL
 };
-static int patch_interactive, add_interactive, edit_interactive;
+static int patch_interactive, add_interactive, edit_interactive, multi_patch_interactive;
 static int take_worktree_changes;
 static int add_renormalize;
 static int pathspec_file_nul;
@@ -168,7 +168,9 @@ int interactive_add(struct repository *repo,
 		       PATHSPEC_PREFIX_ORIGIN,
 		       prefix, argv);
 
-	if (patch)
+	if (patch == 2)
+		ret = !!run_add_multi_patch(repo, NULL, &pathspec);
+	else if (patch == 1)
 		ret = !!run_add_p(repo, ADD_P_ADD, NULL, &pathspec);
 	else
 		ret = !!run_add_i(repo, &pathspec);
@@ -253,6 +255,7 @@ static struct option builtin_add_options[] = {
 	OPT_GROUP(""),
 	OPT_BOOL('i', "interactive", &add_interactive, N_("interactive picking")),
 	OPT_BOOL('p', "patch", &patch_interactive, N_("select hunks interactively")),
+	OPT_BOOL( 0 , "multi-patch", &multi_patch_interactive, N_("select hunks interactively and specify patch file it goes to")),
 	OPT_BOOL('e', "edit", &edit_interactive, N_("edit current diff and apply")),
 	OPT__FORCE(&ignored_too, N_("allow adding otherwise ignored files"), 0),
 	OPT_BOOL('u', "update", &take_worktree_changes, N_("update tracked files")),
@@ -391,6 +394,8 @@ int cmd_add(int argc,
 
 	argc = parse_options(argc, argv, prefix, builtin_add_options,
 			  builtin_add_usage, PARSE_OPT_KEEP_ARGV0);
+	if (multi_patch_interactive)
+		patch_interactive = 1;
 	if (patch_interactive)
 		add_interactive = 1;
 	if (add_interactive) {
@@ -398,7 +403,7 @@ int cmd_add(int argc,
 			die(_("options '%s' and '%s' cannot be used together"), "--dry-run", "--interactive/--patch");
 		if (pathspec_from_file)
 			die(_("options '%s' and '%s' cannot be used together"), "--pathspec-from-file", "--interactive/--patch");
-		exit(interactive_add(repo, argv + 1, prefix, patch_interactive));
+		exit(interactive_add(repo, argv + 1, prefix, patch_interactive + multi_patch_interactive));
 	}
 
 	if (edit_interactive) {

@@ -19,6 +19,9 @@
 #include "color.h"
 #include "compat/terminal.h"
 #include "prompt.h"
+#include "parse.h"
+
+static struct strvec patch_names = STRVEC_INIT;
 
 enum prompt_mode_type {
 	PROMPT_MODE_CHANGE = 0, PROMPT_DELETION, PROMPT_ADDITION, PROMPT_HUNK,
@@ -57,6 +60,29 @@ static struct patch_mode patch_mode_add = {
 		   "a - stage this hunk and all later hunks in the file\n"
 		   "d - do not stage this hunk or any of the later hunks in "
 			"the file\n")
+};
+
+static struct patch_mode multi_patch_mode = {
+	.diff_cmd = { "diff-files", NULL },
+	.apply_args = { "--cached", NULL },
+	.apply_check_args = { "--cached", NULL },
+	.prompt_mode = {
+		N_("Stage mode change [n,q,d,0%s?]? "),
+		N_("Stage deletion [n,q,d,0%s,?]? "),
+		N_("Stage addition [n,q,d,0%s,?]? "),
+		N_("Stage this hunk [n,q,d,0%s,?]? ")
+	},
+	.edit_hunk_hint = N_("If the patch applies cleanly, the edited hunk "
+			     "will immediately be grouped with the other hunks."),
+	.help_patch_text =
+		N_("n - do not stage this hunk\n"
+		   "q - quit; do not stage this hunk or any of the remaining "
+			"ones\n"
+		   "d - do not stage this hunk or any of the later hunks in "
+			"the file\n"
+		   "0 - create a new patch file and add this hunk to that "
+			"new file\n"
+		   "1-9 - add this hunk to corresponding named patch file\n")
 };
 
 static struct patch_mode patch_mode_stash = {
@@ -256,6 +282,7 @@ struct hunk {
 	size_t start, end, colored_start, colored_end, splittable_into;
 	ssize_t delta;
 	enum { UNDECIDED_HUNK = 0, SKIP_HUNK, USE_HUNK } use;
+	const char *name;
 	struct hunk_header header;
 };
 
@@ -759,12 +786,13 @@ static void render_diff_header(struct add_p_state *s,
 
 /* Coalesce hunks again that were split */
 static int merge_hunks(struct add_p_state *s, struct file_diff *file_diff,
-		       size_t *hunk_index, int use_all, struct hunk *merged)
+		       size_t *hunk_index, int use_all, int multi_patch, struct hunk *merged)
 {
 	size_t i = *hunk_index, delta;
 	struct hunk *hunk = file_diff->hunk + i;
 	/* `header` corresponds to the merged hunk */
 	struct hunk_header *header = &merged->header, *next;
+	const char *named_patch = hunk->name;
 
 	if (!use_all && hunk->use != USE_HUNK)
 		return 0;
@@ -776,6 +804,8 @@ static int merge_hunks(struct add_p_state *s, struct file_diff *file_diff,
 	for (; i + 1 < file_diff->hunk_nr; i++) {
 		hunk++;
 		next = &hunk->header;
+		int same_patch_file = !multi_patch || hunk->name == named_patch;
+		int use_hunk = hunk->use == USE_HUNK && same_patch_file;
 
 		/*
 		 * Stop merging hunks when:
@@ -783,7 +813,7 @@ static int merge_hunks(struct add_p_state *s, struct file_diff *file_diff,
 		 * - the hunk is not selected for use, or
 		 * - the hunk does not overlap with the already-merged hunk(s)
 		 */
-		if ((!use_all && hunk->use != USE_HUNK) ||
+		if ((!use_all && !use_hunk) ||
 		    header->new_offset >= next->new_offset + merged->delta ||
 		    header->new_offset + header->new_count
 		    < next->new_offset + merged->delta)
@@ -885,6 +915,51 @@ static int merge_hunks(struct add_p_state *s, struct file_diff *file_diff,
 	return 1;
 }
 
+static void reassemble_named_patch(struct add_p_state *s,
+			     const char *name,
+			     struct strbuf *out)
+{
+	size_t i, j, matching_hunks;
+	struct hunk *hunk;
+	size_t save_len = s->plain.len;
+
+	for (i = 0; i < s->file_diff_nr; i++) {
+		struct file_diff file_diff = s->file_diff[i];
+		ssize_t delta = 0;
+		for (j = 0, matching_hunks = 0; j < file_diff.hunk_nr; j++) {
+			hunk = file_diff.hunk + j;
+			if (hunk->use == USE_HUNK && hunk->name == name)
+				matching_hunks++;
+		}
+		if (matching_hunks == 0) continue;
+		render_diff_header(s, &file_diff, 0, out);
+		for (j = file_diff.mode_change; j < file_diff.hunk_nr; j++) {
+			struct hunk merged = { 0 };
+
+			hunk = file_diff.hunk + j;
+			if (hunk->use != USE_HUNK || hunk->name != name)
+				delta += hunk->header.old_count
+					- hunk->header.new_count;
+			else {
+				/* merge overlapping hunks into a temporary hunk */
+				if (merge_hunks(s, &file_diff, &j, 0, 1, &merged))
+					hunk = &merged;
+
+				render_hunk(s, hunk, delta, 0, out);
+
+				/*
+				 * In case `merge_hunks()` used `plain` as a scratch
+				 * pad (this happens when an edited hunk had to be
+				 * coalesced with another hunk).
+				 */
+				strbuf_setlen(&s->plain, save_len);
+
+				delta += hunk->delta;
+			}
+		}
+	}
+}
+
 static void reassemble_patch(struct add_p_state *s,
 			     struct file_diff *file_diff, int use_all,
 			     struct strbuf *out)
@@ -904,7 +979,7 @@ static void reassemble_patch(struct add_p_state *s,
 				- hunk->header.new_count;
 		else {
 			/* merge overlapping hunks into a temporary hunk */
-			if (merge_hunks(s, file_diff, &i, use_all, &merged))
+			if (merge_hunks(s, file_diff, &i, use_all, 0, &merged))
 				hunk = &merged;
 
 			render_hunk(s, hunk, delta, 0, out);
@@ -1405,6 +1480,336 @@ N_("j - leave this hunk undecided, see next undecided hunk\n"
    "p - print the current hunk, 'P' to use the pager\n"
    "? - print help\n");
 
+static int multi_patch_group_hunks(struct add_p_state *s,
+				      struct file_diff *file_diff)
+{
+	size_t hunk_index = 0;
+	ssize_t i, undecided_previous, undecided_next, rendered_hunk_index = -1;
+	struct hunk *hunk;
+	char ch;
+	int colored = !!s->colored.len, quit = 0;
+	enum prompt_mode_type prompt_mode_type;
+	enum {
+		ALLOW_GOTO_PREVIOUS_HUNK = 1 << 0,
+		ALLOW_GOTO_PREVIOUS_UNDECIDED_HUNK = 1 << 1,
+		ALLOW_GOTO_NEXT_HUNK = 1 << 2,
+		ALLOW_GOTO_NEXT_UNDECIDED_HUNK = 1 << 3,
+		ALLOW_SEARCH_AND_GOTO = 1 << 4,
+		ALLOW_SPLIT = 1 << 5
+	} permitted = 0;
+
+	/* Empty added files have no hunks */
+	if (!file_diff->hunk_nr && !file_diff->added)
+		return 0;
+
+	strbuf_reset(&s->buf);
+	render_diff_header(s, file_diff, colored, &s->buf);
+	fputs(s->buf.buf, stdout);
+	for (;;) {
+		if (hunk_index >= file_diff->hunk_nr)
+			hunk_index = 0;
+		hunk = file_diff->hunk_nr
+				? file_diff->hunk + hunk_index
+				: &file_diff->head;
+		undecided_previous = -1;
+		undecided_next = -1;
+
+		if (file_diff->hunk_nr) {
+			for (i = hunk_index - 1; i >= 0; i--)
+				if (file_diff->hunk[i].use == UNDECIDED_HUNK) {
+					undecided_previous = i;
+					break;
+				}
+
+			for (i = hunk_index + 1; i < file_diff->hunk_nr; i++)
+				if (file_diff->hunk[i].use == UNDECIDED_HUNK) {
+					undecided_next = i;
+					break;
+				}
+		}
+
+		/* Everything decided? */
+		if (undecided_previous < 0 && undecided_next < 0 &&
+		    hunk->use != UNDECIDED_HUNK)
+			break;
+
+		strbuf_reset(&s->buf);
+		if (file_diff->hunk_nr) {
+			if (rendered_hunk_index != hunk_index) {
+				render_hunk(s, hunk, 0, colored, &s->buf);
+				fputs(s->buf.buf, stdout);
+				rendered_hunk_index = hunk_index;
+			}
+
+			strbuf_reset(&s->buf);
+			if (patch_names.nr) {
+				int nr = patch_names.nr > 9 ? 9 : patch_names.nr;
+				char range[5];
+				snprintf(range, 5, ",1-%d", nr);
+				strbuf_addstr(&s->buf, range);
+			}
+			if (undecided_previous >= 0) {
+				permitted |= ALLOW_GOTO_PREVIOUS_UNDECIDED_HUNK;
+				strbuf_addstr(&s->buf, ",k");
+			}
+			if (hunk_index) {
+				permitted |= ALLOW_GOTO_PREVIOUS_HUNK;
+				strbuf_addstr(&s->buf, ",K");
+			}
+			if (undecided_next >= 0) {
+				permitted |= ALLOW_GOTO_NEXT_UNDECIDED_HUNK;
+				strbuf_addstr(&s->buf, ",j");
+			}
+			if (hunk_index + 1 < file_diff->hunk_nr) {
+				permitted |= ALLOW_GOTO_NEXT_HUNK;
+				strbuf_addstr(&s->buf, ",J");
+			}
+			if (file_diff->hunk_nr > 1) {
+				permitted |= ALLOW_SEARCH_AND_GOTO;
+				strbuf_addstr(&s->buf, ",g,/");
+			}
+			if (hunk->splittable_into > 1) {
+				permitted |= ALLOW_SPLIT;
+				strbuf_addstr(&s->buf, ",s");
+			}
+			// TODO: Permit 'e' once editing a hunk is possible
+			strbuf_addstr(&s->buf, ",p");
+		}
+		if (file_diff->deleted)
+			prompt_mode_type = PROMPT_DELETION;
+		else if (file_diff->added)
+			prompt_mode_type = PROMPT_ADDITION;
+		else if (file_diff->mode_change && !hunk_index)
+			prompt_mode_type = PROMPT_MODE_CHANGE;
+		else
+			prompt_mode_type = PROMPT_HUNK;
+
+		printf("%s(%"PRIuMAX"/%"PRIuMAX") ", s->s.prompt_color,
+			      (uintmax_t)hunk_index + 1,
+			      (uintmax_t)(file_diff->hunk_nr
+						? file_diff->hunk_nr
+						: 1));
+		printf(_(s->mode->prompt_mode[prompt_mode_type]),
+		       s->buf.buf);
+		if (patch_names.nr != 0) {
+			const char *name;
+			for (i = 0; i < patch_names.nr; i++) {
+				name = patch_names.v[i];
+				if (i % 3 == 0) {
+					printf("\n%s%lu: %s", s->s.prompt_color, i+1, name);
+				} else if (i % 3 == 2) {
+					printf(", %lu: %s%s", i+1, name, s->s.reset_color);
+				} else {
+					printf(", %lu: %s", i+1, name);
+				}
+			}
+			printf("%s\n%s> %s", s->s.reset_color, s->s.prompt_color, s->s.reset_color);
+		}
+		if (*s->s.reset_color)
+			fputs(s->s.reset_color, stdout);
+		fflush(stdout);
+		if (read_single_character(s) == EOF)
+			break;
+
+		if (!s->answer.len)
+			continue;
+		ch = tolower(s->answer.buf[0]);
+		if (ch == '0') {
+			if (patch_names.nr >= 9) {
+				err(s, "Already too many named patch. Maximum is 9");
+				continue;
+			} else {
+				printf("%sEnter a new patch file name: %s",
+				s->s.prompt_color, s->s.reset_color);
+				strbuf_reset(&s->answer);
+				git_read_line_interactively(&s->answer);
+				const char *new_patch_name = strbuf_detach(&s->answer, NULL);
+				strvec_push(&patch_names, new_patch_name);
+				const char *chosen_patch_name = patch_names.v[patch_names.nr - 1];
+				hunk->name = chosen_patch_name;
+				hunk->use = USE_HUNK;
+				goto soft_increment;
+			}
+		}
+		else if (ch >= '1' && ch <= '9') {
+			int index = ch - '1';
+			if (index >= patch_names.nr) {
+				err(s, "index '%d' out of bounds, must be between '1' and '%lu'",
+					index+1, patch_names.nr);
+				continue;
+			} else {
+				const char *chosen_patch_name = patch_names.v[index];
+				hunk->name = chosen_patch_name;
+				hunk->use = USE_HUNK;
+			}
+soft_increment:
+			hunk_index = undecided_next < 0 ?
+				file_diff->hunk_nr : undecided_next;
+		} else if (ch == 'n') {
+			hunk->use = SKIP_HUNK;
+			goto soft_increment;
+		} else if (ch == 'd' || ch == 'q') {
+			if (file_diff->hunk_nr) {
+				for (; hunk_index < file_diff->hunk_nr; hunk_index++) {
+					hunk = file_diff->hunk + hunk_index;
+					if (hunk->use == UNDECIDED_HUNK)
+						hunk->use = SKIP_HUNK;
+				}
+			} else if (hunk->use == UNDECIDED_HUNK) {
+				hunk->use = SKIP_HUNK;
+			}
+			if (ch == 'q') {
+				quit = 1;
+				break;
+			}
+		} else if (s->answer.buf[0] == 'K') {
+			if (permitted & ALLOW_GOTO_PREVIOUS_HUNK)
+				hunk_index--;
+			else
+				err(s, _("No previous hunk"));
+		} else if (s->answer.buf[0] == 'J') {
+			if (permitted & ALLOW_GOTO_NEXT_HUNK)
+				hunk_index++;
+			else
+				err(s, _("No next hunk"));
+		} else if (s->answer.buf[0] == 'k') {
+			if (permitted & ALLOW_GOTO_PREVIOUS_UNDECIDED_HUNK)
+				hunk_index = undecided_previous;
+			else
+				err(s, _("No previous hunk"));
+		} else if (s->answer.buf[0] == 'j') {
+			if (permitted & ALLOW_GOTO_NEXT_UNDECIDED_HUNK)
+				hunk_index = undecided_next;
+			else
+				err(s, _("No next hunk"));
+		} else if (s->answer.buf[0] == 'g') {
+			char *pend;
+			unsigned long response;
+
+			if (!(permitted & ALLOW_SEARCH_AND_GOTO)) {
+				err(s, _("No other hunks to goto"));
+				continue;
+			}
+			strbuf_remove(&s->answer, 0, 1);
+			strbuf_trim(&s->answer);
+			i = hunk_index - DISPLAY_HUNKS_LINES / 2;
+			if (i < (int)file_diff->mode_change)
+				i = file_diff->mode_change;
+			while (s->answer.len == 0) {
+				i = display_hunks(s, file_diff, i);
+				printf("%s", i < file_diff->hunk_nr ?
+				       _("go to which hunk (<ret> to see "
+					 "more)? ") : _("go to which hunk? "));
+				fflush(stdout);
+				if (strbuf_getline(&s->answer,
+						   stdin) == EOF)
+					break;
+				strbuf_trim_trailing_newline(&s->answer);
+			}
+
+			strbuf_trim(&s->answer);
+			response = strtoul(s->answer.buf, &pend, 10);
+			if (*pend || pend == s->answer.buf)
+				err(s, _("Invalid number: '%s'"),
+				    s->answer.buf);
+			else if (0 < response && response <= file_diff->hunk_nr)
+				hunk_index = response - 1;
+			else
+				err(s, Q_("Sorry, only %d hunk available.",
+					  "Sorry, only %d hunks available.",
+					  file_diff->hunk_nr),
+				    (int)file_diff->hunk_nr);
+		} else if (s->answer.buf[0] == '/') {
+			regex_t regex;
+			int ret;
+
+			if (!(permitted & ALLOW_SEARCH_AND_GOTO)) {
+				err(s, _("No other hunks to search"));
+				continue;
+			}
+			strbuf_remove(&s->answer, 0, 1);
+			strbuf_trim_trailing_newline(&s->answer);
+			if (s->answer.len == 0) {
+				printf("%s", _("search for regex? "));
+				fflush(stdout);
+				if (strbuf_getline(&s->answer,
+						   stdin) == EOF)
+					break;
+				strbuf_trim_trailing_newline(&s->answer);
+				if (s->answer.len == 0)
+					continue;
+			}
+			ret = regcomp(&regex, s->answer.buf,
+				      REG_EXTENDED | REG_NOSUB | REG_NEWLINE);
+			if (ret) {
+				char errbuf[1024];
+
+				regerror(ret, &regex, errbuf, sizeof(errbuf));
+				err(s, _("Malformed search regexp %s: %s"),
+				    s->answer.buf, errbuf);
+				continue;
+			}
+			i = hunk_index;
+			for (;;) {
+				/* render the hunk into a scratch buffer */
+				render_hunk(s, file_diff->hunk + i, 0, 0,
+					    &s->buf);
+				if (regexec(&regex, s->buf.buf, 0, NULL, 0)
+				    != REG_NOMATCH)
+					break;
+				i++;
+				if (i == file_diff->hunk_nr)
+					i = 0;
+				if (i != hunk_index)
+					continue;
+				err(s, _("No hunk matches the given pattern"));
+				break;
+			}
+			regfree(&regex);
+			hunk_index = i;
+		} else if (s->answer.buf[0] == 's') {
+			size_t splittable_into = hunk->splittable_into;
+			if (!(permitted & ALLOW_SPLIT)) {
+				err(s, _("Sorry, cannot split this hunk"));
+			} else if (!split_hunk(s, file_diff,
+					     hunk - file_diff->hunk)) {
+				color_fprintf_ln(stdout, s->s.header_color,
+						 _("Split into %d hunks."),
+						 (int)splittable_into);
+				rendered_hunk_index = -1;
+			}
+		// TODO: 	Implement editing hunks 'e' in a way that splits the hunk into multiple and loop over them
+		} else if (s->answer.buf[0] == 'p') {
+			rendered_hunk_index = -1;
+		} else {
+			const char *p = _(help_patch_remainder), *eol = p;
+
+			color_fprintf(stdout, s->s.help_color, "%s",
+				      _(s->mode->help_patch_text));
+
+			/*
+			 * Show only those lines of the remainder that are
+			 * actually applicable with the current hunk.
+			 */
+			for (; *p; p = eol + (*eol == '\n')) {
+				eol = strchrnul(p, '\n');
+
+				/*
+				 * `s->buf` still contains the part of the
+				 * commands shown in the prompt that are not
+				 * always available.
+				 */
+				if (*p != '?' && !strchr(s->buf.buf, *p))
+					continue;
+
+				color_fprintf_ln(stdout, s->s.help_color,
+						 "%.*s", (int)(eol - p), p);
+			}
+		}
+	}
+	return quit;
+}
+
 static int patch_update_file(struct add_p_state *s,
 			     struct file_diff *file_diff)
 {
@@ -1757,6 +2162,61 @@ soft_increment:
 
 	putchar('\n');
 	return quit;
+
+}
+
+int run_add_multi_patch(struct repository *r,
+	      const char *revision, const struct pathspec *ps)
+{
+	struct add_p_state s = {
+		{ r }, STRBUF_INIT, STRBUF_INIT, STRBUF_INIT, STRBUF_INIT
+	};
+	size_t i, binary_count = 0;
+
+	init_add_i_state(&s.s, r);
+
+	s.mode = &multi_patch_mode;
+	s.revision = revision;
+
+	discard_index(r->index);
+	if (repo_read_index(r) < 0 ||
+	    (!s.mode->index_only &&
+	     repo_refresh_and_write_index(r, REFRESH_QUIET, 0, 1,
+					  NULL, NULL, NULL) < 0) ||
+	    parse_diff(&s, ps) < 0) {
+		add_p_state_clear(&s);
+		return -1;
+	}
+
+	for (i = 0; i < s.file_diff_nr; i++)
+		if (s.file_diff[i].binary && !s.file_diff[i].hunk_nr)
+			binary_count++;
+		else if (multi_patch_group_hunks(&s, s.file_diff + i))
+			break;
+
+
+	for (i = 0; i < patch_names.nr; i++) {
+		const char *patch_name = patch_names.v[i];
+		strbuf_reset(&s.buf);
+		reassemble_named_patch(&s, patch_name, &s.buf);
+		size_t len = strlen(patch_name);
+		char filename[len + 7];
+		snprintf(filename, len+7, "%s.patch", patch_name);
+		FILE *patch_file = fopen(filename, "w");
+		fputs(s.buf.buf, patch_file);
+		fclose(patch_file);
+	}
+
+
+
+	if (s.file_diff_nr == 0)
+		fprintf(stderr, _("No changes.\n"));
+	else if (binary_count == s.file_diff_nr)
+		fprintf(stderr, _("Only binary files changed.\n"));
+
+	add_p_state_clear(&s);
+	return 0;
+
 }
 
 int run_add_p(struct repository *r, enum add_p_mode mode,
